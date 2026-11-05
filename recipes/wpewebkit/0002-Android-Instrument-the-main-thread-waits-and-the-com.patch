@@ -1,0 +1,1182 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Alejandro G. Castro" <alex@igalia.com>
+Date: Thu, 5 Nov 2026 16:42:45 +0100
+Subject: [PATCH 2/3] [Android] Instrument the main-thread waits and the
+ composite that stall a scroll
+
+Touch-driven scrolling is asynchronous since the coordinated touch-event work, but a
+sequence can still be classified Synchronous, a wheel event can still need blocking DOM
+dispatch, and the scrolling thread still blocks on the main thread's rendering update once
+a frame. A scroll can also stall with no main-thread involvement at all, when the composite
+itself overruns the frame. None of that was observable on Android: the port builds with
+-DUSE_SYSPROF_CAPTURE=OFF, so every WTF::tracePoint() and every signpost compiled to
+nothing.
+
+Add an ATrace backend for both, so the instrumentation WebKit already has lands in the same
+systrace/Perfetto timeline as SurfaceFlinger, input dispatch and the scheduler. Tracepoint
+slice names are derived from the TracePointCode enumerators rather than a hand-written
+table, so codes added upstream show up without further work. Signposts are keyed by a
+pointer and may begin and end on different threads, so they map to process-scoped sections
+rather than the thread-scoped kind, and HAVE(SIGNPOSTS) now says when the helpers that build
+their descriptions are worth compiling.
+
+Annotate the points that decide whether the main thread is on the critical path, naming the
+reason in the slice: the tracking type each touch event gets and which non-passive listener
+forced it, the wheel processing steps, any scrolling node with synchronous scrolling
+reasons, the touch round trip and how many moves coalesced behind it, and how long each wait
+for the main thread actually took.
+
+Then split the composite, which the signposts only bounded as a whole: the damage-collect
+walk, the draw walk, and the GPU handover, with flush() separated from submit() because they
+fail differently - flush() turns recorded draws into GPU commands, where a program compile or
+a texture upload lands, while submit() only hands the command buffer over, where driver queue
+back-pressure would land. Each intermediate surface a layer asks for is named and counted, and
+so is the GPU resource growth a frame causes.
+
+Two levels are opt-in because of what they cost: debug.wpe.atrace=layers adds a slice per
+layer painted, and =shaders reports every GPU program Skia compiles, which needs a
+PersistentCache whose load() always misses - Skia then fetches the compiled binary to hand
+over, which on Mali roughly triples the worst composite. The timing of those compilations is
+the signal, not their cost.
+
+Rebased onto the backend from https://github.com/WebKit/WebKit/pull/78343: the backend
+additions here are behind its USE(ATRACE_CAPTURE) option instead of OS(ANDROID).
+Style checker fixes: include order, switch indent, std::string_view instead of strcmp(),
+lambda spacing.
+---
+ Source/WTF/wtf/SystemTracing.h                |  68 ++++-
+ Source/WTF/wtf/android/ATraceAnnotator.cpp    | 279 ++++++++++++------
+ Source/WTF/wtf/android/ATraceAnnotator.h      |  86 ++++--
+ .../WebCore/page/scrolling/ScrollingTree.cpp  |  17 ++
+ .../page/scrolling/ThreadedScrollingTree.cpp  |  23 +-
+ .../coordinated/ScrollingTreeCoordinated.cpp  |  13 +-
+ .../graphics/skia/PlatformDisplaySkia.cpp     |  39 +++
+ .../graphics/skia/SkiaCompositingLayer.cpp    |  39 ++-
+ .../graphics/skia/SkiaCompositingLayer.h      |   4 +
+ .../UIProcess/API/wpe/WPEWebViewPlatform.cpp  |   5 +
+ Source/WebKit/UIProcess/WebPageProxy.cpp      |  16 +-
+ .../ThreadedCompositor.cpp                    |  33 ++-
+ .../WebProcess/WebPage/EventDispatcher.cpp    |  45 ++-
+ 13 files changed, 535 insertions(+), 132 deletions(-)
+
+diff --git a/Source/WTF/wtf/SystemTracing.h b/Source/WTF/wtf/SystemTracing.h
+index 3a081f536aee..78f632dcf00c 100644
+--- a/Source/WTF/wtf/SystemTracing.h
++++ b/Source/WTF/wtf/SystemTracing.h
+@@ -45,6 +45,12 @@
+ #include <sys/types.h>
+ #endif
+ 
++// True when WTFBeginSignpost and friends actually emit something. Guards the helpers that
++// exist only to build a signpost's description, which are dead weight otherwise.
++#if !defined(HAVE_SIGNPOSTS) && (HAVE(OS_SIGNPOST) || USE(SYSPROF_CAPTURE) || USE(ATRACE_CAPTURE))
++#define HAVE_SIGNPOSTS 1
++#endif
++
+ // No namespaces because this file has to be includable from C and Objective-C.
+ 
+ // Reserved kdebug codes. Do not change these.
+@@ -235,10 +241,7 @@ inline void tracePoint(TracePointCode code, uint64_t data1 = 0, uint64_t data2 =
+     UNUSED_PARAM(data3);
+     UNUSED_PARAM(data4);
+ #elif USE(ATRACE_CAPTURE)
+-    ATraceAnnotator::tracePoint(code, data1);
+-    UNUSED_PARAM(data2);
+-    UNUSED_PARAM(data3);
+-    UNUSED_PARAM(data4);
++    ATraceAnnotator::tracePoint(code, data1, data2, data3, data4);
+ #else
+     UNUSED_PARAM(code);
+     UNUSED_PARAM(data1);
+@@ -530,10 +533,15 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END \
+ 
+ #elif USE(ATRACE_CAPTURE)
+ 
++// Signposts carry a pointer key and may begin and end on different threads, so they map to
++// process-scoped ATrace sections rather than the thread-scoped kind. The name has to match
++// between begin and end for Perfetto to pair them, so a description goes out as its own
++// marker instead of being folded into the name.
++
+ #define WTF_ATRACE_UNUSED(...) ((void)sizeof(WTF::aTraceIgnore(0 __VA_OPT__(, __VA_ARGS__))))
+ // Arguments go through LOG_PRINTF_TYPE, as for sysprof, so string objects reach the
+ // printf-style formatter as plain C strings.
+-#define WTFATraceFormatAndArgs(name, ...) _STRINGIFY(name) __VA_OPT__(" " WTFATraceSplitFormatAndArgs(__VA_ARGS__))
++#define WTFATraceFormatAndArgs(name, ...) _STRINGIFY(name) " " __VA_OPT__(WTFATraceSplitFormatAndArgs(__VA_ARGS__))
+ #define WTFATraceSplitFormatAndArgs(format, ...) format __VA_OPT__(, LOG_PRINTF_TYPE(__VA_ARGS__))
+ 
+ #define WTFEmitSignpost(pointer, name, ...) \
+@@ -544,7 +552,7 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END \
+             WTF::ATraceAnnotator::instant(WTFATraceFormatAndArgs(name, __VA_ARGS__)); \
+         IGNORE_WARNINGS_END \
+         IGNORE_WARNINGS_END \
+-        UNUSED_PARAM((pointer)); \
++        UNUSED_PARAM(pointer); \
+     } while (0)
+ 
+ #define WTFBeginSignpost(pointer, name, ...) \
+@@ -561,14 +569,8 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END \
+ 
+ #define WTFEndSignpost(pointer, name, ...) \
+     do { \
+-        IGNORE_WARNINGS_BEGIN("format-zero-length") \
+-        IGNORE_WARNINGS_BEGIN("unsafe-buffer-usage-in-format-attr-call") \
+-        if (WTF::ATraceAnnotator::isEnabled()) { \
+-            __VA_OPT__(WTF::ATraceAnnotator::instant(WTFATraceFormatAndArgs(name, __VA_ARGS__));) \
+-            WTF::ATraceAnnotator::endAsync(_STRINGIFY(name), WTF::ATraceAnnotator::cookieForPointer(pointer)); \
+-        } \
+-        IGNORE_WARNINGS_END \
+-        IGNORE_WARNINGS_END \
++        WTF::ATraceAnnotator::endAsync(_STRINGIFY(name), WTF::ATraceAnnotator::cookieForPointer(pointer)); \
++        WTF_ATRACE_UNUSED(__VA_ARGS__); \
+     } while (0)
+ 
+ #define WTFEmitSignpostAlways(pointer, name, ...) WTFEmitSignpost((pointer), name, ##__VA_ARGS__)
+@@ -577,7 +579,7 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END \
+ 
+ // ATrace timestamps events as they are emitted and cannot backdate one, so the variants
+ // that carry their own time have nowhere to put it.
+-#define WTFEmitSignpostWithTimeDelta(pointer, name, timeDelta, ...) do { UNUSED_PARAM((pointer)); UNUSED_PARAM((timeDelta)); WTF_ATRACE_UNUSED(__VA_ARGS__); } while (0)
++#define WTFEmitSignpostWithTimeDelta(pointer, name, timeDelta, ...) do { UNUSED_PARAM(pointer); UNUSED_PARAM(timeDelta); WTF_ATRACE_UNUSED(__VA_ARGS__); } while (0)
+ #define WTFBeginSignpostWithTimeDelta(pointer, name, timeDelta, ...) WTFEmitSignpostWithTimeDelta((pointer), name, (timeDelta), ##__VA_ARGS__)
+ #define WTFEndSignpostWithTimeDelta(pointer, name, timeDelta, ...) WTFEmitSignpostWithTimeDelta((pointer), name, (timeDelta), ##__VA_ARGS__)
+ 
+@@ -585,7 +587,7 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END \
+ #define WTFBeginSignpostAlwaysWithTimeDelta(pointer, name, timeDelta, ...) WTFEmitSignpostWithTimeDelta((pointer), name, (timeDelta), ##__VA_ARGS__)
+ #define WTFEndSignpostAlwaysWithTimeDelta(pointer, name, timeDelta, ...) WTFEmitSignpostWithTimeDelta((pointer), name, (timeDelta), ##__VA_ARGS__)
+ 
+-#define WTFEmitSignpostWithSpecificTime(pointer, name, specificTime, ...) do { UNUSED_PARAM((pointer)); UNUSED_PARAM((specificTime)); WTF_ATRACE_UNUSED(__VA_ARGS__); } while (0)
++#define WTFEmitSignpostWithSpecificTime(pointer, name, specificTime, ...) do { UNUSED_PARAM(pointer); UNUSED_PARAM(specificTime); WTF_ATRACE_UNUSED(__VA_ARGS__); } while (0)
+ #define WTFBeginSignpostWithSpecificTime(pointer, name, specificTime, ...) WTFEmitSignpostWithSpecificTime((pointer), name, (specificTime), ##__VA_ARGS__)
+ #define WTFEndSignpostWithSpecificTime(pointer, name, specificTime, ...) WTFEmitSignpostWithSpecificTime((pointer), name, (specificTime), ##__VA_ARGS__)
+ 
+@@ -624,3 +626,37 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END \
+ #define WTFSetCounter(name, value) do { } while (0)
+ 
+ #endif
++
++// Scroll and touch annotations that carry their reason in the slice name. They go to
++// Android's systrace/Perfetto timeline; elsewhere they compile away.
++#if USE(ATRACE_CAPTURE)
++
++#define WPE_TRACE_ENABLED() WTF::ATraceAnnotator::isEnabled()
++#define WPE_TRACE_SCOPE(name) WTF::ATraceScope __wpeTraceScope(name)
++#define WPE_TRACE_SCOPE_FORMATTED(...) WTF::ATraceFormattedScope __wpeTraceScope(WTF::ATraceAnnotator::isEnabled(), __VA_ARGS__)
++#define WPE_TRACE_LAYERS_ENABLED() WTF::ATraceAnnotator::layersEnabled()
++#define WPE_TRACE_LAYER_SCOPE(...) WTF::ATraceFormattedScope __wpeTraceLayerScope(WTF::ATraceAnnotator::layersEnabled(), __VA_ARGS__)
++#define WPE_TRACE_BEGIN(name) WTF::ATraceAnnotator::begin(name)
++#define WPE_TRACE_END() WTF::ATraceAnnotator::end()
++#define WPE_TRACE_ASYNC_COOKIE() WTF::ATraceAnnotator::nextCookie()
++#define WPE_TRACE_ASYNC_BEGIN(name, cookie) WTF::ATraceAnnotator::beginAsync(name, cookie)
++#define WPE_TRACE_ASYNC_END(name, cookie) WTF::ATraceAnnotator::endAsync(name, cookie)
++#define WPE_TRACE_INSTANT(...) WTF::ATraceAnnotator::instant(__VA_ARGS__)
++#define WPE_TRACE_COUNTER(name, value) WTF::ATraceAnnotator::counter(name, value)
++
++#else
++
++#define WPE_TRACE_ENABLED() false
++#define WPE_TRACE_SCOPE(name) do { } while (0)
++#define WPE_TRACE_SCOPE_FORMATTED(...) do { } while (0)
++#define WPE_TRACE_LAYERS_ENABLED() false
++#define WPE_TRACE_LAYER_SCOPE(...) do { } while (0)
++#define WPE_TRACE_BEGIN(name) do { } while (0)
++#define WPE_TRACE_END() do { } while (0)
++#define WPE_TRACE_ASYNC_COOKIE() 0
++#define WPE_TRACE_ASYNC_BEGIN(name, cookie) do { UNUSED_PARAM(cookie); } while (0)
++#define WPE_TRACE_ASYNC_END(name, cookie) do { UNUSED_PARAM(cookie); } while (0)
++#define WPE_TRACE_INSTANT(...) do { } while (0)
++#define WPE_TRACE_COUNTER(name, value) do { UNUSED_PARAM(value); } while (0)
++
++#endif
+diff --git a/Source/WTF/wtf/android/ATraceAnnotator.cpp b/Source/WTF/wtf/android/ATraceAnnotator.cpp
+index b7a111665a2b..74146f414b02 100644
+--- a/Source/WTF/wtf/android/ATraceAnnotator.cpp
++++ b/Source/WTF/wtf/android/ATraceAnnotator.cpp
+@@ -25,17 +25,18 @@
+ #include <algorithm>
+ #include <android/trace.h>
+ #include <array>
++#include <atomic>
+ #include <cstdarg>
+ #include <cstdio>
+ #include <span>
+ #include <string_view>
++#include <sys/system_properties.h>
+ #include <wtf/SystemTracing.h>
+ 
+ namespace WTF {
+ 
+-// Every TracePointCode, so a slice name can be derived from the enumerator itself. rawCodeName()
+-// has no default case, so a code added to the enum but not here is a -Wswitch warning rather than
+-// a trace point that silently goes missing.
++// Every TracePointCode, so a slice name can be derived from the enumerator itself instead
++// of a hand-written table that silently goes stale when upstream adds a code.
+ #define WTF_TRACE_POINT_CODE_LIST(M) \
+     M(VMEntryScopeStart) \
+     M(VMEntryScopeEnd) \
+@@ -176,29 +177,115 @@ namespace {
+ 
+ enum class SliceKind : uint8_t { Begin, End, Instant };
+ 
++enum class Coverage : uint8_t { Off, Scroll, Layers, Shaders, All };
++
+ } // namespace
+ 
+-static const char* rawCodeName(TracePointCode code)
++static const char* rawCodeName(unsigned code)
+ {
++    switch (static_cast<TracePointCode>(code)) {
+ #define WTF_TRACE_POINT_CODE_NAME(name) case name: return #name;
+-
+-    switch (code) {
+         WTF_TRACE_POINT_CODE_LIST(WTF_TRACE_POINT_CODE_NAME)
+-    case WTFRange:
+-    case JavaScriptRange:
+-    case WebCoreRange:
+-    case WebKitRange:
+-    case WebKit2Range:
+-    case UIProcessRange:
+-    case GPUProcessRange:
+-    case GTKWPEPortRange:
+-        return nullptr;
+-    }
+-
+ #undef WTF_TRACE_POINT_CODE_NAME
++    default:
++        break;
++    }
+     return nullptr;
+ }
+ 
++// The subset that says something about a scroll: what the main thread is busy with, when
++// the scrolling thread is blocked on it, and when a frame actually reaches the compositor.
++static bool isScrollRelevant(unsigned code)
++{
++    switch (static_cast<TracePointCode>(code)) {
++    case StyleRecalcStart:
++    case StyleRecalcEnd:
++    case RenderTreeBuildStart:
++    case RenderTreeBuildEnd:
++    case PerformLayoutStart:
++    case PerformLayoutEnd:
++    case RenderTreeLayoutStart:
++    case RenderTreeLayoutEnd:
++    case PaintLayerStart:
++    case PaintLayerEnd:
++    case RAFCallbackStart:
++    case RAFCallbackEnd:
++    case UpdateTouchRegionsStart:
++    case UpdateTouchRegionsEnd:
++    case ComputeEventRegionsStart:
++    case ComputeEventRegionsEnd:
++    case ScheduleRenderingUpdate:
++    case TriggerRenderingUpdate:
++    case RenderingUpdateStart:
++    case RenderingUpdateEnd:
++    case CompositingUpdateStart:
++    case CompositingUpdateEnd:
++    case DispatchTouchEventsStart:
++    case DispatchTouchEventsEnd:
++    case ParseHTMLStart:
++    case ParseHTMLEnd:
++    case ScrollingThreadRenderUpdateSyncStart:
++    case ScrollingThreadRenderUpdateSyncEnd:
++    case ScrollingThreadDisplayDidRefreshStart:
++    case ScrollingThreadDisplayDidRefreshEnd:
++    case ScrollingTreeDisplayDidRefresh:
++    case ProgrammaticScroll:
++    case PerformOpportunisticallyScheduledTasksStart:
++    case PerformOpportunisticallyScheduledTasksEnd:
++    case ThreadTimersStart:
++    case ThreadTimersEnd:
++    case TimerFiredStart:
++    case TimerFiredEnd:
++    case IncrementalSweepStart:
++    case IncrementalSweepEnd:
++    case SyncTouchEventStart:
++    case SyncTouchEventEnd:
++    case SyncMessageStart:
++    case SyncMessageEnd:
++    case LayerTreeHostRenderingUpdateStart:
++    case LayerTreeHostRenderingUpdateEnd:
++    case WaitForCompositionCompletionStart:
++    case WaitForCompositionCompletionEnd:
++    case RenderLayerTreeStart:
++    case RenderLayerTreeEnd:
++    case UpdateLayerContentBuffersStart:
++    case UpdateLayerContentBuffersEnd:
++        return true;
++    default:
++        return false;
++    }
++}
++
++// ThreadedScrollingTree opens this span on the main thread and closes it on the scrolling
++// thread, so it cannot use a thread-scoped slice.
++static bool isCrossThreadSpan(unsigned code)
++{
++    return code == ScrollingThreadRenderUpdateSyncStart || code == ScrollingThreadRenderUpdateSyncEnd;
++}
++
++static Coverage readCoverage()
++{
++    char value[PROP_VALUE_MAX] = { };
++    if (__system_property_get("debug.wpe.atrace", value) <= 0)
++        return Coverage::Scroll;
++    std::string_view setting { value };
++    if (setting == "off" || setting == "0")
++        return Coverage::Off;
++    if (setting == "all")
++        return Coverage::All;
++    if (setting == "layers")
++        return Coverage::Layers;
++    if (setting == "shaders")
++        return Coverage::Shaders;
++    return Coverage::Scroll;
++}
++
++static Coverage coverage()
++{
++    static Coverage coverage = readCoverage();
++    return coverage;
++}
++
+ // The enumerators are named <Span><Start|Begin|End|Stop>, so the span name and whether the
+ // code opens or closes it both fall out of the suffix.
+ static SliceKind sliceKindAndName(std::string_view rawName, std::span<char> buffer)
+@@ -230,51 +317,75 @@ static SliceKind sliceKindAndName(std::string_view rawName, std::span<char> buff
+     return SliceKind::Instant;
+ }
+ 
+-// Thread-scoped slices nest, so every begin needs its end on the same thread.
+-static void emitThreadSlice(SliceKind kind, const char* name)
++bool ATraceAnnotator::isEnabled()
+ {
+-    switch (kind) {
+-    case SliceKind::Begin:
+-        ATrace_beginSection(name);
+-        break;
+-    case SliceKind::End:
+-        ATrace_endSection();
+-        break;
+-    case SliceKind::Instant:
+-        // ATrace has no instant event, so a zero-length slice stands in for one.
+-        ATrace_beginSection(name);
++    return coverage() != Coverage::Off && ATrace_isEnabled();
++}
++
++bool ATraceAnnotator::shaderTracingRequested()
++{
++    return coverage() == Coverage::Shaders;
++}
++
++bool ATraceAnnotator::layersEnabled()
++{
++    auto requested = coverage();
++    return (requested == Coverage::Layers || requested == Coverage::All) && ATrace_isEnabled();
++}
++
++ATraceFormattedScope::ATraceFormattedScope(bool enabled, const char* format, ...)
++{
++    if (!enabled)
++        return;
++
++    char buffer[256];
++    va_list args;
++    va_start(args, format);
++    vsnprintf(buffer, sizeof(buffer), format, args);
++    va_end(args);
++
++    ATrace_beginSection(buffer);
++    m_active = true;
++}
++
++ATraceFormattedScope::~ATraceFormattedScope()
++{
++    if (m_active)
+         ATrace_endSection();
+-        break;
+-    }
+ }
+ 
+-// Process-scoped slices pair by name and cookie, so they can end on another thread than the one
+-// they began on.
+-static void emitAsyncSlice(SliceKind kind, const char* name, int32_t cookie)
++int32_t ATraceAnnotator::nextCookie()
+ {
+-    if (kind == SliceKind::Begin)
+-        ATrace_beginAsyncSection(name, cookie);
+-    else
+-        ATrace_endAsyncSection(name, cookie);
++    static std::atomic<int32_t> cookie { 1 };
++    return cookie.fetch_add(1, std::memory_order_relaxed) & 0x7fffffff;
+ }
+ 
+-// These carry the same data at their begin and at their end, which tells apart what they trace,
+-// and may end on another thread, so pair them by that data, as SysprofAnnotator does. Without data
+-// there is nothing to pair by, so they become a thread-scoped slice. Perfetto keeps only the first
+-// of repeated begins with the same name and cookie, so a load that begins again on a redirect is
+-// still timed from its first begin.
+-static void emitSliceByData(SliceKind kind, const char* name, uint64_t data)
++void ATraceAnnotator::begin(const char* name)
+ {
+-    if (!data) {
+-        emitThreadSlice(kind, name);
++    if (!isEnabled())
+         return;
+-    }
+-    emitAsyncSlice(kind, name, ATraceAnnotator::cookieForValue(static_cast<uintptr_t>(data)));
++    ATrace_beginSection(name);
+ }
+ 
+-bool ATraceAnnotator::isEnabled()
++void ATraceAnnotator::beginFormatted(const char* format, ...)
+ {
+-    return ATrace_isEnabled();
++    if (!isEnabled())
++        return;
++
++    char buffer[256];
++    va_list args;
++    va_start(args, format);
++    vsnprintf(buffer, sizeof(buffer), format, args);
++    va_end(args);
++
++    ATrace_beginSection(buffer);
++}
++
++void ATraceAnnotator::end()
++{
++    if (!isEnabled())
++        return;
++    ATrace_endSection();
+ }
+ 
+ void ATraceAnnotator::beginAsync(const char* name, int32_t cookie)
+@@ -299,11 +410,10 @@ void ATraceAnnotator::instant(const char* format, ...)
+     char buffer[256];
+     va_list args;
+     va_start(args, format);
+-    WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
+     vsnprintf(buffer, sizeof(buffer), format, args);
+-    WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
+     va_end(args);
+ 
++    // ATrace has no instant event, so a zero-length slice stands in for one.
+     ATrace_beginSection(buffer);
+     ATrace_endSection();
+ }
+@@ -315,50 +425,49 @@ void ATraceAnnotator::counter(const char* name, int64_t value)
+     ATrace_setCounter(name, value);
+ }
+ 
+-void ATraceAnnotator::tracePoint(unsigned code, uint64_t data1)
++void ATraceAnnotator::tracePoint(unsigned code, uint64_t data1, uint64_t, uint64_t, uint64_t)
+ {
+-    if (!isEnabled())
++    auto requested = coverage();
++    if (requested == Coverage::Off || !ATrace_isEnabled())
++        return;
++    if (requested != Coverage::All && !isScrollRelevant(code))
+         return;
+ 
+-    auto traceCode = static_cast<TracePointCode>(code);
+-    const char* rawName = rawCodeName(traceCode);
++    const char* rawName = rawCodeName(code);
+     if (!rawName)
+         return;
+ 
+     std::array<char, 128> name;
+     auto kind = sliceKindAndName(rawName, std::span { name });
+ 
+-    switch (traceCode) {
+-    // The begin and the end of a load are named differently, so the suffix cannot give them the
+-    // one name they need to pair.
+-    case MainResourceLoadDidStartProvisional:
+-        emitSliceByData(SliceKind::Begin, "MainResourceLoad", data1);
+-        break;
+-    case MainResourceLoadDidEnd:
+-        emitSliceByData(SliceKind::End, "MainResourceLoad", data1);
+-        break;
+-    case SubresourceLoadWillStart:
+-        emitSliceByData(SliceKind::Begin, "SubresourceLoad", data1);
+-        break;
+-    case SubresourceLoadDidEnd:
+-        emitSliceByData(SliceKind::End, "SubresourceLoad", data1);
+-        break;
+-    case FlushRemoteImageBufferStart:
+-    case FlushRemoteImageBufferEnd:
+-    case ProcessLaunchStart:
+-    case ProcessLaunchEnd:
+-    case FromJSStart:
+-    case FromJSStop:
+-        emitSliceByData(kind, name.data(), data1);
++    if (isCrossThreadSpan(code)) {
++        // Only one of these is ever in flight per process, so a fixed cookie is enough.
++        if (kind == SliceKind::Begin)
++            ATrace_beginAsyncSection(name.data(), 0);
++        else {
++            ATrace_endAsyncSection(name.data(), 0);
++            if (code == ScrollingThreadRenderUpdateSyncEnd) {
++                // data1 is set when the scrolling thread gave up waiting for the main thread.
++                ATrace_setCounter("wpe.scroll.desynchronized", data1 ? 1 : 0);
++                if (data1) {
++                    ATrace_beginSection("scroll: desynchronized, main thread rendering update too slow");
++                    ATrace_endSection();
++                }
++            }
++        }
++        return;
++    }
++
++    switch (kind) {
++    case SliceKind::Begin:
++        ATrace_beginSection(name.data());
+         break;
+-    // ThreadedScrollingTree begins this one on the main thread and ends it on the scrolling
+-    // thread. Only one is ever in flight per process, so a fixed cookie is enough.
+-    case ScrollingThreadRenderUpdateSyncStart:
+-    case ScrollingThreadRenderUpdateSyncEnd:
+-        emitAsyncSlice(kind, name.data(), 0);
++    case SliceKind::End:
++        ATrace_endSection();
+         break;
+-    default:
+-        emitThreadSlice(kind, name.data());
++    case SliceKind::Instant:
++        ATrace_beginSection(name.data());
++        ATrace_endSection();
+         break;
+     }
+ }
+diff --git a/Source/WTF/wtf/android/ATraceAnnotator.h b/Source/WTF/wtf/android/ATraceAnnotator.h
+index 25946c5993c0..e618674bf58f 100644
+--- a/Source/WTF/wtf/android/ATraceAnnotator.h
++++ b/Source/WTF/wtf/android/ATraceAnnotator.h
+@@ -26,38 +26,63 @@
+ #include <cstdint>
+ #include <type_traits>
+ #include <wtf/ExportMacros.h>
++#include <wtf/Noncopyable.h>
+ 
+ namespace WTF {
+ 
+-// Bridges WebKit's tracepoints, signposts and counters onto Android's ATrace. Everything lands in
+-// the same systrace/Perfetto timeline as SurfaceFlinger, input dispatch and the scheduler, which
+-// is what makes it possible to line up a janky frame with whatever the web process was doing at
+-// the time.
++// Bridges WebKit tracepoints, plus the scrolling and touch annotations added on top of
++// them, onto Android's ATrace. Everything lands in the same systrace/Perfetto timeline as
++// SurfaceFlinger, input dispatch and the scheduler, which is what makes it possible to
++// line a scroll stall up with whatever the web process main thread was doing at the time.
+ //
+-// Tracing is off until a capture session enables the app tag for the process (`atrace -a` or
+-// Perfetto's atrace_apps), so the cost in a normal run is one relaxed atomic load per call site.
++// Tracing is off until a capture session enables the app tag for the process (`atrace -a`
++// or Perfetto's atrace_apps), so the cost in a normal run is one relaxed atomic load per
++// call site.
++//
++// The `debug.wpe.atrace` system property selects how much is emitted:
++//   unset / "scroll"  only the scrolling, touch, rendering-update and compositing codes
++//   "layers"          the above plus a slice per layer painted, which is voluminous but is
++//                     the only way to see which layer makes a composite overrun its frame
++//   "shaders"         the scroll set plus a marker every time Skia compiles a GPU program;
++//                     this one perturbs what it measures, see shaderTracingRequested()
++//   "all"             every tracepoint WebKit emits, plus the per-layer slices
++//   "off"             nothing
+ class ATraceAnnotator {
+ public:
+     WTF_EXPORT_PRIVATE static bool isEnabled();
+ 
+-    // Called from WTF::tracePoint(). The code is a TracePointCode, passed as unsigned because that
+-    // enum cannot be forward declared.
+-    WTF_EXPORT_PRIVATE static void tracePoint(unsigned code, uint64_t data1);
++    // Per-layer paint slices are opt-in: there are hundreds per frame, enough to fill a
++    // trace buffer during a single gesture.
++    WTF_EXPORT_PRIVATE static bool layersEnabled();
++
++    // Reporting GPU program compilation costs something to observe - Skia has to fetch the
++    // compiled binary to hand it over - so it is opt-in and read once, before any tracing
++    // session can have started.
++    WTF_EXPORT_PRIVATE static bool shaderTracingRequested();
++
++    // Generic tracepoint bridge, called from WTF::tracePoint(). The code is a
++    // TracePointCode, passed as unsigned because that enum cannot be forward declared.
++    WTF_EXPORT_PRIVATE static void tracePoint(unsigned code, uint64_t data1, uint64_t data2, uint64_t data3, uint64_t data4);
++
++    // Thread-scoped slices. These nest, so every begin needs its end on the same thread.
++    WTF_EXPORT_PRIVATE static void begin(const char* name);
++    WTF_EXPORT_PRIVATE static void beginFormatted(const char* format, ...) WTF_ATTRIBUTE_PRINTF(1, 2);
++    WTF_EXPORT_PRIVATE static void end();
+ 
+     // Process-scoped slices, for spans that begin and end on different threads.
+     WTF_EXPORT_PRIVATE static void beginAsync(const char* name, int32_t cookie);
+     WTF_EXPORT_PRIVATE static void endAsync(const char* name, int32_t cookie);
++    WTF_EXPORT_PRIVATE static int32_t nextCookie();
+ 
+-    // Zero-length marker whose name carries the description.
++    // Zero-length marker whose name carries the reason.
+     WTF_EXPORT_PRIVATE static void instant(const char* format, ...) WTF_ATTRIBUTE_PRINTF(1, 2);
+-
+-    WTF_EXPORT_PRIVATE static void counter(const char* name, int64_t);
+-
+-    // Signposts are keyed by a pointer and may begin and end on different threads, so they map to
+-    // process-scoped sections with a cookie derived from that pointer. Call sites key a signpost
+-    // on either an address or an opaque integer identifier, so both have to fold down to a
+-    // cookie. The XOR keeps small identifiers distinct, which a plain shift would collapse onto
+-    // zero.
++    // Signposts are keyed by a pointer and may begin and end on different threads, so they
++    // map to process-scoped sections with a cookie derived from that pointer. The section
++    // name has to match between begin and end for them to pair, so any description the
++    // signpost carries is emitted separately as a marker.
++    // Call sites key a signpost on either an address or an opaque integer identifier, so
++    // both have to fold down to a cookie. The XOR keeps small identifiers distinct, which a
++    // plain shift would collapse onto zero.
+     static int32_t cookieForValue(uintptr_t value)
+     {
+         return static_cast<int32_t>(((value >> 4) ^ value) & 0x7fffffff);
+@@ -73,12 +98,33 @@ public:
+     {
+         return cookieForValue(static_cast<uintptr_t>(value));
+     }
++
++    WTF_EXPORT_PRIVATE static void counter(const char* name, int64_t);
+ };
+ 
+-// Lets a macro reference its arguments without evaluating them, so a disabled signpost costs
+-// nothing and still does not provoke unused-variable warnings.
++// Lets a macro reference its arguments without evaluating them, so a disabled signpost
++// costs nothing and still does not provoke unused-variable warnings.
+ template<typename... Args> int aTraceIgnore(Args&&...);
+ 
++class ATraceScope {
++    WTF_MAKE_NONCOPYABLE(ATraceScope);
++public:
++    explicit ATraceScope(const char* name) { ATraceAnnotator::begin(name); }
++    ~ATraceScope() { ATraceAnnotator::end(); }
++};
++
++// A scope whose name is built from the values it describes, and which can be switched off
++// wholesale so the arguments are not even formatted.
++class ATraceFormattedScope {
++    WTF_MAKE_NONCOPYABLE(ATraceFormattedScope);
++public:
++    WTF_EXPORT_PRIVATE ATraceFormattedScope(bool enabled, const char* format, ...) WTF_ATTRIBUTE_PRINTF(3, 4);
++    WTF_EXPORT_PRIVATE ~ATraceFormattedScope();
++
++private:
++    bool m_active { false };
++};
++
+ } // namespace WTF
+ 
+ #endif // USE(ATRACE_CAPTURE)
+diff --git a/Source/WebCore/page/scrolling/ScrollingTree.cpp b/Source/WebCore/page/scrolling/ScrollingTree.cpp
+index 837b065d7b23..dc0ec834494f 100644
+--- a/Source/WebCore/page/scrolling/ScrollingTree.cpp
++++ b/Source/WebCore/page/scrolling/ScrollingTree.cpp
+@@ -44,6 +44,7 @@
+ #include "ScrollingTreePositionedNode.h"
+ #include "ScrollingTreeScrollingNode.h"
+ #include <wtf/SetForScope.h>
++#include <wtf/SystemTracing.h>
+ #include <wtf/TZoneMallocInlines.h>
+ #include <wtf/text/TextStream.h>
+ 
+@@ -134,6 +135,17 @@ OptionSet<WheelEventProcessingSteps> ScrollingTree::computeWheelProcessingSteps(
+     return { WheelEventProcessingSteps::AsyncScrolling };
+ }
+ 
++static const char* wheelProcessingName(OptionSet<WheelEventProcessingSteps> steps)
++{
++    if (steps.contains(WheelEventProcessingSteps::SynchronousScrolling))
++        return "SynchronousScrolling (main thread scrolls)";
++    if (steps.contains(WheelEventProcessingSteps::BlockingDOMEventDispatch))
++        return "AsyncScrolling + BlockingDOMEventDispatch";
++    if (steps.contains(WheelEventProcessingSteps::NonBlockingDOMEventDispatch))
++        return "AsyncScrolling + NonBlockingDOMEventDispatch";
++    return "AsyncScrolling";
++}
++
+ OptionSet<WheelEventProcessingSteps> ScrollingTree::determineWheelEventProcessing(const PlatformWheelEvent& wheelEvent)
+ {
+     // This method is invoked by the event handling thread
+@@ -149,6 +161,11 @@ OptionSet<WheelEventProcessingSteps> ScrollingTree::determineWheelEventProcessin
+ 
+     auto processingSteps = computeWheelProcessingSteps(wheelEvent);
+ 
++    // The touch gesture is delivered to the engine as a wheel event, so this is where a
++    // scroll that looked asynchronous at the touch layer can still end up on the main thread.
++    WPE_TRACE_INSTANT("wheel processing: %s", wheelProcessingName(processingSteps));
++    WPE_TRACE_COUNTER("wpe.wheel.blocking", processingSteps.containsAny({ WheelEventProcessingSteps::SynchronousScrolling, WheelEventProcessingSteps::BlockingDOMEventDispatch }) ? 1 : 0);
++
+     m_latchingController.receivedWheelEvent(wheelEvent, processingSteps, m_allowLatching);
+ 
+     LOG_WITH_STREAM(Scrolling, stream << "\nScrollingTree::determineWheelEventProcessing: " << wheelEvent << " processingSteps " << processingSteps);
+diff --git a/Source/WebCore/page/scrolling/ThreadedScrollingTree.cpp b/Source/WebCore/page/scrolling/ThreadedScrollingTree.cpp
+index 77e274b5febc..0604339788f2 100644
+--- a/Source/WebCore/page/scrolling/ThreadedScrollingTree.cpp
++++ b/Source/WebCore/page/scrolling/ThreadedScrollingTree.cpp
+@@ -124,13 +124,19 @@ void ThreadedScrollingTree::waitForEventToBeProcessedByMainThread(const Platform
+     auto startTime = MonotonicTime::now();
+     auto timeoutTime = startTime + maxAllowableMainThreadDelay;
+ 
++    WPE_TRACE_BEGIN("scroll: gesture start blocked on main thread wheel handler");
+     bool receivedEvent = m_waitingForBeganEventCondition.waitUntil(m_treeLock, timeoutTime, [&] {
+         assertIsHeld(m_treeLock);
+         return m_receivedBeganEventFromMainThread;
+     });
++    WPE_TRACE_END();
++
++    auto waitDuration = MonotonicTime::now() - startTime;
++    WPE_TRACE_COUNTER("wpe.scroll.gesture-start-wait-us", waitDuration.microsecondsAs<int64_t>());
+ 
+     if (!receivedEvent) {
+         // Timed out, go asynchronous.
++        WPE_TRACE_INSTANT("scroll: gesture start timed out after %d ms, going non-blocking", static_cast<int>(waitDuration.millisecondsAs<int64_t>()));
+         setGestureState(WheelScrollGestureState::NonBlocking);
+     }
+ 
+@@ -228,9 +234,22 @@ void ThreadedScrollingTree::propagateSynchronousScrollingReasons(const HashSet<S
+ 
+     m_hasNodesWithSynchronousScrollingReasons = !synchronousScrollingNodes.isEmpty();
+ 
++    // With any of these set the scrolling thread may not move layers by itself, so every
++    // frame of the scroll has to come from the main thread no matter how the touch was
++    // classified.
++    WPE_TRACE_COUNTER("wpe.scroll.nodes-forcing-main-thread", synchronousScrollingNodes.size());
++
+     for (auto nodeID : synchronousScrollingNodes) {
+-        if (RefPtr node = nodeForID(nodeID))
++        if (RefPtr node = nodeForID(nodeID)) {
++            if (WPE_TRACE_ENABLED()) {
++                if (RefPtr scrollingNode = dynamicDowncast<ScrollingTreeScrollingNode>(*node)) {
++                    TextStream description;
++                    description << "scroll: node " << nodeID << " forces main thread scrolling: " << scrollingNode->synchronousScrollingReasons();
++                    WPE_TRACE_INSTANT("%s", reinterpret_cast<const char*>(description.release().utf8().data()));
++                }
++            }
+             propagateStateToAncestors(*node);
++        }
+     }
+ }
+ 
+@@ -493,6 +512,8 @@ void ThreadedScrollingTree::waitForRenderingUpdateCompletionOrTimeout()
+ 
+     ASSERT(m_treeLock.isLocked());
+ 
++    WPE_TRACE_COUNTER("wpe.scroll.rendering-update-wait-us", (MonotonicTime::now() - currentTime).microsecondsAs<int64_t>());
++
+     if (!becameIdle) {
+         m_state = SynchronizationState::Desynchronized;
+         // At this point we know the main thread is taking too long in the rendering update,
+diff --git a/Source/WebCore/page/scrolling/coordinated/ScrollingTreeCoordinated.cpp b/Source/WebCore/page/scrolling/coordinated/ScrollingTreeCoordinated.cpp
+index c3108ca10a6c..1500d3c3855c 100644
+--- a/Source/WebCore/page/scrolling/coordinated/ScrollingTreeCoordinated.cpp
++++ b/Source/WebCore/page/scrolling/coordinated/ScrollingTreeCoordinated.cpp
+@@ -41,6 +41,7 @@
+ #include "ScrollingTreePositionedNodeCoordinated.h"
+ #include "ScrollingTreeStickyNodeCoordinated.h"
+ #include <ranges>
++#include <wtf/SystemTracing.h>
+ 
+ namespace WebCore {
+ 
+@@ -369,8 +370,10 @@ static TrackingType mergeTrackingTypes(TrackingType a, TrackingType b)
+ TrackingType ScrollingTreeCoordinated::eventTrackingTypeForTouchEvent(const PlatformTouchEvent& event)
+ {
+     auto offset = mainFrameScrollOffset();
+-    if (!offset)
++    if (!offset) {
++        WPE_TRACE_INSTANT("touch: no main frame scroll offset, scrolling tree not committed yet");
+         return TrackingType::NotTracking;
++    }
+ 
+     for (auto& touchPoint : event.touchPoints()) {
+         if (touchPoint.state() != PlatformTouchPoint::State::TouchPressed)
+@@ -380,8 +383,10 @@ TrackingType ScrollingTreeCoordinated::eventTrackingTypeForTouchEvent(const Plat
+         location.move(*offset);
+ 
+         auto layerAndPoint = findLayerOfEventRegionAtPoint(*this, location);
+-        if (!layerAndPoint)
++        if (!layerAndPoint) {
++            WPE_TRACE_INSTANT("touch: no layer with an event region under the touch point");
+             continue;
++        }
+ 
+         Locker layerLocker { layerAndPoint->first->lock() };
+         auto& eventRegion = layerAndPoint->first->eventRegion();
+@@ -391,6 +396,10 @@ TrackingType ScrollingTreeCoordinated::eventTrackingTypeForTouchEvent(const Plat
+                 return;
+ 
+             auto trackingTypeForLocation = eventRegion.eventTrackingTypeForPoint(eventType, roundedIntPoint(layerAndPoint->second));
++            // Naming the event type that forces the sequence synchronous is the whole
++            // point: it is what a page has to drop, or make passive, to scroll async.
++            if (trackingTypeForLocation == TrackingType::Synchronous)
++                WPE_TRACE_INSTANT("touch sync forced by non-passive %s listener", EventTrackingRegions::eventName(eventType).characters());
+             trackingType = mergeTrackingTypes(trackingType, trackingTypeForLocation);
+         };
+ 
+diff --git a/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp b/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp
+index 22bcc672ff79..cf8e41ff1bf4 100644
+--- a/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp
+@@ -52,6 +52,7 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ #include <wtf/MemoryPressureHandler.h>
+ #include <wtf/NeverDestroyed.h>
+ #include <wtf/RAMSize.h>
++#include <wtf/SystemTracing.h>
+ #include <wtf/ThreadSafeWeakPtr.h>
+ #include <wtf/text/StringToIntegerConversion.h>
+ 
+@@ -64,6 +65,34 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ 
+ namespace WebCore {
+ 
++#if USE(ATRACE_CAPTURE)
++class ProgramCompilationTracer final : public GrContextOptions::PersistentCache {
++public:
++    sk_sp<SkData> load(const SkData&) final
++    {
++        WPE_TRACE_COUNTER("wpe.skia.program-lookups", ++m_lookups);
++        return nullptr;
++    }
++
++    void store(const SkData&, const SkData& data, const SkString& description) final
++    {
++        WPE_TRACE_INSTANT("skia: compiled a GPU program (%zu bytes) %s", data.size(), description.c_str());
++        WPE_TRACE_COUNTER("wpe.skia.programs-compiled", ++m_compilations);
++    }
++
++private:
++    std::atomic<int64_t> m_lookups { 0 };
++    std::atomic<int64_t> m_compilations { 0 };
++};
++
++static ProgramCompilationTracer& programCompilationTracer()
++{
++    static NeverDestroyed<ProgramCompilationTracer> tracer;
++    return tracer.get();
++}
++#endif
++
++
+ #if PLATFORM(GTK) || PLATFORM(WPE)
+ #if CPU(X86) || CPU(X86_64)
+ // On x86 ot x86_64 we need at least 8 samples for the antialiasing result to be similar
+@@ -340,6 +369,16 @@ private:
+ 
+         // FIXME: Add shader cache.
+         GrContextOptions options;
++#if USE(ATRACE_CAPTURE)
++        // Not a cache: load() always misses, exactly as today with no cache at all, so the
++        // engine behaves the same. It is here because Skia calls store() precisely when it
++        // has compiled a new program, which is the only way to see program compilation in a
++        // trace. Observing it is not free - Skia fetches the compiled binary to hand over,
++        // which on Mali roughly tripled the worst composite - so it is behind
++        // debug.wpe.atrace=shaders and the timing of the stores is the signal, not the cost.
++        if (WTF::ATraceAnnotator::shaderTracingRequested())
++            options.fPersistentCache = &programCompilationTracer();
++#endif
+         options.fAllowMSAAOnNewIntel = shouldAllowMSAAOnNewIntel();
+         // Skia defaults this to true, which alters the texture2D() calls in all generated shaders,
+         // applying a so-called negative LOD bias, forcing texture2D() sampling into a LOD-computing
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.cpp b/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.cpp
+index 88643416fde1..db6ed7886d00 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.cpp
+@@ -57,6 +57,7 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ #include <wtf/Scope.h>
+ #include <wtf/SetForScope.h>
++#include <wtf/SystemTracing.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
+ namespace WebCore {
+@@ -589,7 +590,10 @@ bool SkiaCompositingLayer::paint(SkCanvas& canvas, std::optional<Damage>& frameD
+         // device by the device pixel ratio.
+         const auto canvasSize = canvas.getBaseLayerSize();
+         SkNoDrawCanvas noDrawCanvas(canvasSize.width(), canvasSize.height());
+-        recursivePaint(noDrawCanvas, collectContext);
++        {
++            WPE_TRACE_SCOPE("composite: collect damage walk");
++            recursivePaint(noDrawCanvas, collectContext);
++        }
+ 
+         m_layerRectTracker->damageStaleLayerRectsAndAdvanceEntries(*frameDamage);
+         resolveBackdropDamage(collectContext.collectState->backdropRectsInFrame, *frameDamage);
+@@ -637,8 +641,13 @@ bool SkiaCompositingLayer::paint(SkCanvas& canvas, std::optional<Damage>& frameD
+         PaintContext context;
+         context.compositingDamageRegion = WTF::move(damageRegion);
+ 
+-        recursivePaint(canvas, context);
+-        context.imageSetBatch.flushIfNeeded(canvas);
++        {
++            WPE_TRACE_SCOPE("composite: draw walk");
++            recursivePaint(canvas, context);
++            context.imageSetBatch.flushIfNeeded(canvas);
++        }
++        WPE_TRACE_COUNTER("wpe.composite.layers-painted", context.layersPainted);
++        WPE_TRACE_COUNTER("wpe.composite.intermediate-surfaces", context.intermediateSurfaces);
+     }
+ 
+     recursiveCleanUpAfterPaint();
+@@ -646,6 +655,19 @@ bool SkiaCompositingLayer::paint(SkCanvas& canvas, std::optional<Damage>& frameD
+     return hasRunningAnimations;
+ }
+ 
++const char* SkiaCompositingLayer::contentsKindName() const
++{
++    if (m_backingStore)
++        return "tiles";
++    if (m_contentsBuffer)
++        return "buffer";
++    if (m_imageBackingStore)
++        return "image";
++    if (m_contentsSolidColor.isValid() && m_contentsSolidColor.isVisible())
++        return "color";
++    return "container";
++}
++
+ void SkiaCompositingLayer::clipRect(SkCanvas& canvas, const FloatRoundedRect& rect, const TransformationMatrix& transform)
+ {
+     if (transform.isIdentity()) {
+@@ -1094,6 +1116,9 @@ void SkiaCompositingLayer::paintSelfAndChildren(SkCanvas& canvas, PaintContext&
+     if (stopPaintingIntoBackdropIfNeeded(context))
+         return;
+ 
++    ++context.layersPainted;
++    WPE_TRACE_LAYER_SCOPE("layer %.0fx%.0f %s", m_rect.width(), m_rect.height(), contentsKindName());
++
+     paintSelf(canvas, context);
+ 
+     if (m_children.isEmpty())
+@@ -1238,6 +1263,9 @@ void SkiaCompositingLayer::paintWithIntermediateSurface(SkCanvas& canvas, PaintC
+     }
+ #endif
+ 
++    WPE_TRACE_SCOPE_FORMATTED("composite: intermediate surface %dx%d", surfaceRect.width(), surfaceRect.height());
++    ++context.intermediateSurfaces;
++
+     auto* grContext = PlatformDisplay::sharedDisplay().skiaGrContext();
+     auto imageInfo = SkImageInfo::Make(surfaceRect.width(), surfaceRect.height(), kRGBA_8888_SkColorType, kPremul_SkAlphaType, SkColorSpace::MakeSRGB());
+     auto surface = SkSurfaces::RenderTarget(grContext, skgpu::Budgeted::kNo, imageInfo, 0, kTopLeft_GrSurfaceOrigin, nullptr);
+@@ -1260,7 +1288,10 @@ void SkiaCompositingLayer::paintWithIntermediateSurface(SkCanvas& canvas, PaintC
+         paintFunction(*surfaceCanvas, context);
+         context.imageSetBatch.flushIfNeeded(*surfaceCanvas);
+     }
+-    grContext->flushAndSubmit(surface.get(), GrSyncCpu::kNo);
++    {
++        WPE_TRACE_SCOPE("composite: intermediate surface flush");
++        grContext->flushAndSubmit(surface.get(), GrSyncCpu::kNo);
++    }
+ 
+     auto snapshot = surface->makeImageSnapshot();
+ 
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.h b/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.h
+index 01f30a6c9dac..bebb26fce132 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.h
++++ b/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.h
+@@ -237,6 +237,9 @@ private:
+             FilteredImage filtered;
+         };
+         Vector<FilteredBackdrop> filteredBackdrops;
++        // Counted for tracing: how much work a frame's composite turned out to be.
++        unsigned layersPainted { 0 };
++        unsigned intermediateSurfaces { 0 };
+     };
+ 
+     struct Filter {
+@@ -278,6 +281,7 @@ private:
+     void collect3DRenderingContextLayers(Vector<SkiaCompositingLayer3DRenderingContext::Layer>&);
+     void recursiveCleanUpAfterPaint();
+ 
++    const char* contentsKindName() const;
+     void clipRect(SkCanvas&, const FloatRoundedRect&, const TransformationMatrix& = { });
+     void clipRectToDevicePixels(SkCanvas&, const FloatRoundedRect&, const TransformationMatrix&);
+ 
+diff --git a/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.cpp b/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.cpp
+index 0e6e91ee39a9..54dcc22943ca 100644
+--- a/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.cpp
++++ b/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.cpp
+@@ -34,6 +34,7 @@
+ #include "NativeWebMouseEvent.h"
+ #include "NativeWebTouchEvent.h"
+ #include "NativeWebWheelEvent.h"
++#include <wtf/SystemTracing.h>
+ #include "ScreenManager.h"
+ #include "UIGamepadProvider.h"
+ #include "ViewSnapshotStore.h"
+@@ -474,6 +475,9 @@ gboolean ViewPlatform::handleEvent(WPEEvent* event)
+ 
+ void ViewPlatform::handleGesture(WPEEvent* event)
+ {
++    // Reached from doneWithTouchEvent(), that is, only once the web process has replied.
++    WPE_TRACE_SCOPE("UI: gesture recognition");
++
+     auto* gestureController = wpe_view_get_gesture_controller(m_wpeView.get());
+     if (!gestureController)
+         return;
+@@ -537,6 +541,7 @@ void ViewPlatform::handleGesture(WPEEvent* event)
+             GRefPtr<WPEEvent> simulatedScrollEvent = adoptGRef(wpe_event_scroll_new(
+                 m_wpeView.get(), WPE_INPUT_SOURCE_TOUCHSCREEN, 0, static_cast<WPEModifiers>(0), dx, dy, TRUE, FALSE, x, y
+             ));
++            WPE_TRACE_INSTANT("UI: drag -> wheel event (dx %d dy %d)", static_cast<int>(dx), static_cast<int>(dy));
+             page().handleNativeWheelEvent(WebKit::NativeWebWheelEvent::create(simulatedScrollEvent.get(), phase));
+         }
+     }
+diff --git a/Source/WebKit/UIProcess/WebPageProxy.cpp b/Source/WebKit/UIProcess/WebPageProxy.cpp
+index c7f709754ea4..b46b844f6b45 100644
+--- a/Source/WebKit/UIProcess/WebPageProxy.cpp
++++ b/Source/WebKit/UIProcess/WebPageProxy.cpp
+@@ -5850,7 +5850,17 @@ void WebPageProxy::processNextQueuedTouchEvent()
+ 
+     auto& queuedEvent = internals().touchEventQueue.first();
+     protect(legacyMainFrameProcess())->startResponsivenessTimer();
+-    sendWithAsyncReplyToProcessContainingFrame(frameID, Messages::EventDispatcher::TouchEvent(webPageIDInProcess(processContainingFrame(frameID)), frameID, queuedEvent.forwardedEvent.copyRef()), [this, protectedThis = Ref { *this }] (IPC::Connection* connection, WebKit::WebEventType eventType, bool handled) mutable {
++
++    // The gesture recogniser only runs once the reply lands in doneWithTouchEvent(), so
++    // this round trip is the floor on how quickly a finger movement can turn into a scroll.
++    auto cookie = WPE_TRACE_ASYNC_COOKIE();
++    auto sendTime = MonotonicTime::now();
++    WPE_TRACE_ASYNC_BEGIN("UI: touch event round trip", cookie);
++
++    sendWithAsyncReplyToProcessContainingFrame(frameID, Messages::EventDispatcher::TouchEvent(webPageIDInProcess(processContainingFrame(frameID)), frameID, queuedEvent.forwardedEvent.copyRef()), [this, protectedThis = Ref { *this }, cookie, sendTime](IPC::Connection* connection, WebKit::WebEventType eventType, bool handled) mutable {
++        WPE_TRACE_ASYNC_END("UI: touch event round trip", cookie);
++        WPE_TRACE_COUNTER("wpe.ui.touch-round-trip-us", (MonotonicTime::now() - sendTime).microsecondsAs<int64_t>());
++
+         RefPtr pageClient = this->pageClient();
+         if (!pageClient)
+             return;
+@@ -5906,11 +5916,15 @@ void WebPageProxy::handleTouchEvent(IPC::Connection*, Ref<NativeWebTouchEvent>&&
+             event->mergeMovedTouchPointsFrom(lastEvent.forwardedEvent.get());
+             auto replacedEvent = std::exchange(lastEvent.forwardedEvent, WTF::move(event));
+             lastEvent.deferredTouchEvents.append(WTF::move(replacedEvent));
++            // Only one touch event is in flight at a time, so a growing backlog means the
++            // finger is outrunning the replies.
++            WPE_TRACE_COUNTER("wpe.ui.touch-coalesced", lastEvent.deferredTouchEvents.size());
+             return;
+         }
+     }
+ 
+     internals().touchEventQueue.append(WTF::move(event));
++    WPE_TRACE_COUNTER("wpe.ui.touch-queue-depth", internals().touchEventQueue.size());
+ 
+     if (internals().touchEventQueue.size() == 1)
+         processNextQueuedTouchEvent();
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
+index 28b5e033e34e..889973165277 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
+@@ -511,8 +511,37 @@ TargetContents ThreadedCompositor::paintToSkiaCanvas(const TransformationMatrix&
+     if (m_fpsCounter.drawsFPS)
+         drawFPSCounter(*canvas);
+ 
+-    if (auto* surface = canvas->getSurface())
+-        PlatformDisplay::sharedDisplay().skiaGrContext()->flushAndSubmit(surface, GrSyncCpu::kNo);
++    if (auto* surface = canvas->getSurface()) {
++        // Where the frame's GPU work is actually handed to the driver. Split in two because
++        // they fail differently: flush() turns the recorded draws into GPU commands, which is
++        // where a program compile or a texture upload lands, while submit() only hands the
++        // command buffer over, which is where driver queue back-pressure lands.
++        auto* grContext = PlatformDisplay::sharedDisplay().skiaGrContext();
++
++        int resourcesBefore = 0;
++        size_t bytesBefore = 0;
++        const bool tracing = WPE_TRACE_ENABLED();
++        if (tracing)
++            grContext->getResourceCacheUsage(&resourcesBefore, &bytesBefore);
++
++        {
++            WPE_TRACE_SCOPE("composite: flush");
++            grContext->flush(surface);
++        }
++        {
++            WPE_TRACE_SCOPE("composite: submit");
++            grContext->submit(GrSyncCpu::kNo);
++        }
++
++        if (tracing) {
++            int resourcesAfter = 0;
++            size_t bytesAfter = 0;
++            grContext->getResourceCacheUsage(&resourcesAfter, &bytesAfter);
++            // A frame that allocates GPU resources is a frame that uploaded new content.
++            WPE_TRACE_COUNTER("wpe.skia.gpu-resources-added", resourcesAfter - resourcesBefore);
++            WPE_TRACE_COUNTER("wpe.skia.gpu-bytes-added", static_cast<int64_t>(bytesAfter) - static_cast<int64_t>(bytesBefore));
++        }
++    }
+ 
+     if (hasRunningAnimations)
+         requestComposition(CompositionReason::Animation);
+diff --git a/Source/WebKit/WebProcess/WebPage/EventDispatcher.cpp b/Source/WebKit/WebProcess/WebPage/EventDispatcher.cpp
+index af1613ebb1b7..e421d7e64ad1 100644
+--- a/Source/WebKit/WebProcess/WebPage/EventDispatcher.cpp
++++ b/Source/WebKit/WebProcess/WebPage/EventDispatcher.cpp
+@@ -301,6 +301,35 @@ void EventDispatcher::dispatchTouchEvents()
+     }
+ }
+ #elif ENABLE(COORDINATED_TOUCH_EVENTS)
++static ASCIILiteral touchEventName(WebEventType type)
++{
++    switch (type) {
++    case WebEventType::TouchStart:
++        return "TouchStart"_s;
++    case WebEventType::TouchMove:
++        return "TouchMove"_s;
++    case WebEventType::TouchEnd:
++        return "TouchEnd"_s;
++    case WebEventType::TouchCancel:
++        return "TouchCancel"_s;
++    default:
++        return "Touch?"_s;
++    }
++}
++
++static ASCIILiteral trackingTypeName(WebCore::TrackingType type)
++{
++    switch (type) {
++    case WebCore::TrackingType::NotTracking:
++        return "NotTracking"_s;
++    case WebCore::TrackingType::Asynchronous:
++        return "Asynchronous"_s;
++    case WebCore::TrackingType::Synchronous:
++        return "Synchronous"_s;
++    }
++    return "?"_s;
++}
++
+ void EventDispatcher::dispatchTouchEventViaMainThread(WebCore::PageIdentifier pageID, Ref<WebTouchEvent>&& touchEvent, CompletionHandler<void(WebEventType, bool)>&& completionHandler)
+ {
+     RunLoop::mainSingleton().dispatch([protectedThis = Ref { *this }, pageID, touchEvent = WTF::move(touchEvent), completionHandler = WTF::move(completionHandler)] mutable {
+@@ -328,6 +357,9 @@ void EventDispatcher::touchEvent(PageIdentifier pageID, FrameIdentifier frameID,
+ 
+     auto trackingType = scrollingTree->eventTrackingTypeForTouchEvent(platform(touchEvent));
+ 
++    WPE_TRACE_INSTANT("touch %s classified %s", touchEventName(touchEvent->type()).characters(), trackingTypeName(trackingType).characters());
++    WPE_TRACE_COUNTER("wpe.touch.blocking", trackingType == TrackingType::Synchronous ? 1 : 0);
++
+     if (trackingType == TrackingType::NotTracking) {
+         completionHandler(touchEvent->type(), false);
+         return;
+@@ -337,7 +369,18 @@ void EventDispatcher::touchEvent(PageIdentifier pageID, FrameIdentifier frameID,
+         dispatchTouchEventViaMainThread(pageID, WTF::move(touchEvent), nullptr);
+         return;
+     }
+-    dispatchTouchEventViaMainThread(pageID, WTF::move(touchEvent), WTF::move(completionHandler));
++
++    // The page has a non-passive listener here, so the reply, and with it the whole
++    // gesture, has to wait for the main thread. This is the span that shows up as a
++    // stalled scroll, so measure it rather than guess at it.
++    auto cookie = WPE_TRACE_ASYNC_COOKIE();
++    auto startTime = MonotonicTime::now();
++    WPE_TRACE_ASYNC_BEGIN("touch blocked on web process main thread", cookie);
++    dispatchTouchEventViaMainThread(pageID, WTF::move(touchEvent), [cookie, startTime, completionHandler = WTF::move(completionHandler)](WebEventType type, bool handled) mutable {
++        WPE_TRACE_ASYNC_END("touch blocked on web process main thread", cookie);
++        WPE_TRACE_COUNTER("wpe.touch.main-thread-block-us", (MonotonicTime::now() - startTime).microsecondsAs<int64_t>());
++        completionHandler(type, handled);
++    });
+ }
+ #endif
+ 
+-- 
+2.53.0
+

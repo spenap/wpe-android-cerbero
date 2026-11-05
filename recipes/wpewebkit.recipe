@@ -81,6 +81,12 @@ class Recipe(recipe.Recipe):
     build_variant = next(o.split('=', 1)[1] for o in configure_options if o.startswith('-DCMAKE_BUILD_TYPE='))
     cmake_generator = 'ninja'
 
+    patches = [
+        'wpewebkit/0001-WPE-Android-Send-trace-points-signposts-and-counters.patch',
+        'wpewebkit/0002-Android-Instrument-the-main-thread-waits-and-the-com.patch',
+        'wpewebkit/0003-Android-Trace-the-scroll-position-each-composited-fr.patch',
+    ]
+
     files_libs = [
         'libWPEWebKit-2.0',
         'libWPEWebDriver'

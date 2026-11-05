@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Simon Pena <spena@igalia.com>
+Date: Thu, 5 Nov 2026 16:44:03 +0100
+Subject: [PATCH 3/3] [Android] Trace the scroll position each composited frame
+ shows
+
+Add two trace counters, wpe.scroll.drawn-x and wpe.scroll.drawn-y. They give the main
+frame's scroll position, in 1/100 CSS px, at the moment the compositor applies it to the
+root scrolled contents layer for a frame.
+
+A scroll measurement needs the offset each frame on screen shows. The scrolling tree's own
+position is not enough: it moves before the compositor draws it, and a frame can be drawn
+without it. With these counters, a trace can pair each change with the next buffer the
+system compositor shows, instead of guessing the offset from a screen recording.
+
+The scrolling tree marks the layer, so the counters exist only while the main frame is
+scrolled by the scrolling tree (async scrolling on).
+
+* Source/WebCore/page/scrolling/coordinated/ScrollingTreeFrameScrollingNodeCoordinated.cpp:
+(WebCore::ScrollingTreeFrameScrollingNodeCoordinated::repositionScrollingLayers):
+* Source/WebCore/platform/graphics/coordinated/CoordinatedPlatformLayer.cpp:
+(WebCore::CoordinatedPlatformLayer::setTracesScrollPosition):
+(WebCore::CoordinatedPlatformLayer::flushPositionChanges):
+* Source/WebCore/platform/graphics/coordinated/CoordinatedPlatformLayer.h:
+---
+ .../ScrollingTreeFrameScrollingNodeCoordinated.cpp    |  2 ++
+ .../graphics/coordinated/CoordinatedPlatformLayer.cpp | 11 +++++++++++
+ .../graphics/coordinated/CoordinatedPlatformLayer.h   |  2 ++
+ 3 files changed, 15 insertions(+)
+
+diff --git a/Source/WebCore/page/scrolling/coordinated/ScrollingTreeFrameScrollingNodeCoordinated.cpp b/Source/WebCore/page/scrolling/coordinated/ScrollingTreeFrameScrollingNodeCoordinated.cpp
+index 4ac46f820387..fc6333ab318e 100644
+--- a/Source/WebCore/page/scrolling/coordinated/ScrollingTreeFrameScrollingNodeCoordinated.cpp
++++ b/Source/WebCore/page/scrolling/coordinated/ScrollingTreeFrameScrollingNodeCoordinated.cpp
+@@ -109,6 +109,8 @@ void ScrollingTreeFrameScrollingNodeCoordinated::repositionScrollingLayers()
+         return;
+ 
+     auto scrollPosition = currentScrollPosition();
++    if (isRootNode())
++        scrollLayer->setTracesScrollPosition();
+     scrollLayer->setPositionForScrolling(-scrollPosition);
+ }
+ 
+diff --git a/Source/WebCore/platform/graphics/coordinated/CoordinatedPlatformLayer.cpp b/Source/WebCore/platform/graphics/coordinated/CoordinatedPlatformLayer.cpp
+index e6c898aeec80..1b5b2e50232d 100644
+--- a/Source/WebCore/platform/graphics/coordinated/CoordinatedPlatformLayer.cpp
++++ b/Source/WebCore/platform/graphics/coordinated/CoordinatedPlatformLayer.cpp
+@@ -39,6 +39,7 @@
+ #include "GraphicsLayerCoordinated.h"
+ #include "NativeImage.h"
+ #include <wtf/MainThread.h>
++#include <wtf/SystemTracing.h>
+ 
+ #if USE(TEXTURE_MAPPER)
+ #include "CoordinatedBackingStore.h"
+@@ -194,6 +195,12 @@ void CoordinatedPlatformLayer::setPosition(FloatPoint&& position)
+     m_pendingState.position = WTF::move(position);
+ }
+ 
++void CoordinatedPlatformLayer::setTracesScrollPosition()
++{
++    Locker locker { m_lock };
++    m_tracesScrollPosition = true;
++}
++
+ void CoordinatedPlatformLayer::setPositionForScrolling(const FloatPoint& position)
+ {
+     Locker locker { m_lock };
+@@ -1079,6 +1086,10 @@ void CoordinatedPlatformLayer::flushPositionChanges(const OptionSet<CompositionR
+     auto applyPositionChanges = [this](auto& layer) {
+         assertIsHeld(m_lock);
+         if (m_pendingChanges.contains(Change::Position)) {
++            if (m_tracesScrollPosition) {
++                WPE_TRACE_COUNTER("wpe.scroll.drawn-x", static_cast<int64_t>(-m_position.x() * 100));
++                WPE_TRACE_COUNTER("wpe.scroll.drawn-y", static_cast<int64_t>(-m_position.y() * 100));
++            }
+             layer.setPosition(m_position);
+             m_pendingChanges.remove(Change::Position);
+         }
+diff --git a/Source/WebCore/platform/graphics/coordinated/CoordinatedPlatformLayer.h b/Source/WebCore/platform/graphics/coordinated/CoordinatedPlatformLayer.h
+index 1baa79f556ad..6f8b16b37df6 100644
+--- a/Source/WebCore/platform/graphics/coordinated/CoordinatedPlatformLayer.h
++++ b/Source/WebCore/platform/graphics/coordinated/CoordinatedPlatformLayer.h
+@@ -114,6 +114,7 @@ public:
+ 
+     void setPosition(FloatPoint&&) WTF_REQUIRES_LOCK(m_lock);
+     void setPositionForScrolling(const FloatPoint&);
++    void setTracesScrollPosition();
+     const FloatPoint& position() const WTF_REQUIRES_LOCK(m_lock);
+     void setTopLeftPositionForScrolling(const FloatPoint&);
+     FloatPoint topLeftPositionForScrolling();
+@@ -369,6 +370,7 @@ private:
+ #if ENABLE(SCROLLING_THREAD)
+     Markable<ScrollingNodeID> m_scrollingNodeID WTF_GUARDED_BY_LOCK(m_lock);
+ #endif
++    bool m_tracesScrollPosition WTF_GUARDED_BY_LOCK(m_lock) { false };
+ 
+     struct {
+         std::optional<FloatPoint> position;
+-- 
+2.53.0
+
